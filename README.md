@@ -21,6 +21,8 @@ Unlike existing integrations that map everything as a light, this integration co
 | Simple lamp (type 24) | `light` | On / off only |
 | Switch group (type 27) | `switch` | Group on/off |
 | Zigbee temp+humidity (type 46) | `sensor` | °C + % RH |
+| **Scenes (Scenarios)** | `scene` | Native HA scene activation |
+| **Scene Play / Stop** | `button` | Explicit ▶ Play and ⏹ Stop buttons |
 
 ---
 

@@ -71,18 +71,25 @@ def _encrypt(plaintext: str, aes_hex: str) -> bytes:
 # Command packet builder
 # ---------------------------------------------------------------------------
 
-def _build_command_bytes(mac: str, entity_id: int, function: int, value: int | str, aes_hex: str) -> bytes:
+def _build_command_bytes(
+    mac: str,
+    entity_id: int,
+    function: int,
+    value: int | str,
+    aes_hex: str,
+    entity_type: str = "module",
+) -> bytes:
     """
     Build an ICS2000 binary command packet.
 
     Frame layout (43 bytes header + AES encrypted data):
-      [0]     frame number (1)
-      [2]     type (128 = device command)
-      [3..8]  MAC address bytes
-      [9..12] magic number (653213 little-endian)
+      [0]      frame number (1)
+      [2]      type (128 = device command)
+      [3..8]   MAC address bytes
+      [9..12]  magic number (653213 little-endian)
       [29..32] entity ID (little-endian)
       [41..42] data length (little-endian)
-      [43+]   AES-encrypted JSON payload
+      [43+]    AES-encrypted JSON payload
     """
     header = bytearray(43)
     header[0] = 1         # frame
@@ -100,7 +107,7 @@ def _build_command_bytes(mac: str, entity_id: int, function: int, value: int | s
 
     # Build JSON payload
     payload = (
-        '{"module":{"id":' + str(entity_id) +
+        '{"' + entity_type + '":{"id":' + str(entity_id) +
         ',"function":' + str(function) +
         ',"value":' + str(value) + '}}'
     )
@@ -139,6 +146,13 @@ class ICS2000Device:
         return None
 
 
+@dataclass
+class ICS2000Scene:
+    """Represents an ICS2000 Scene."""
+    entity_id: int
+    name: str
+
+
 # ---------------------------------------------------------------------------
 # Hub
 # ---------------------------------------------------------------------------
@@ -155,6 +169,7 @@ class ICS2000Hub:
         self._home_id: int | None = None
         self._local_ip: str | None = None
         self._devices: list[ICS2000Device] = []
+        self._scenes: list[ICS2000Scene] = []
         self._session = requests.Session()
 
     # ------------------------------------------------------------------
@@ -203,7 +218,6 @@ class ICS2000Hub:
             # Send discovery to global broadcast and subnet broadcast
             targets = ["255.255.255.255"]
             try:
-                # Add local broadcast if possible
                 host_ip = socket.gethostbyname(socket.gethostname())
                 subnet = ".".join(host_ip.split(".")[:3]) + ".255"
                 targets.append(subnet)
@@ -219,7 +233,6 @@ class ICS2000Hub:
             data, addr = sock.recvfrom(1024)
             sock.close()
 
-            # Verify response belongs to our hub MAC
             resp_hex = data.hex().lower()
             if self._mac.lower() in resp_hex:
                 self._local_ip = addr[0]
@@ -230,11 +243,11 @@ class ICS2000Hub:
         return self._local_ip
 
     # ------------------------------------------------------------------
-    # Device discovery
+    # Device and Scene discovery
     # ------------------------------------------------------------------
 
     def fetch_devices(self) -> list[ICS2000Device]:
-        """Fetch and decrypt all modules from the ICS2000 gateway."""
+        """Fetch and decrypt all modules and scenes from the ICS2000 gateway."""
         if not self._aes_key:
             _LOGGER.error("Cannot fetch devices: not logged in")
             return []
@@ -259,6 +272,7 @@ class ICS2000Hub:
             return []
 
         devices = []
+        scenes = []
         for raw in modules:
             data_enc = raw.get("data")
             if not data_enc:
@@ -266,9 +280,20 @@ class ICS2000Hub:
             try:
                 decrypted = json.loads(_decrypt(data_enc, self._aes_key))
             except Exception as exc:
-                _LOGGER.debug("Could not decrypt module %s: %s", raw.get("id"), exc)
+                _LOGGER.debug("Could not decrypt entity %s: %s", raw.get("id"), exc)
                 continue
 
+            # Check if this is a scene
+            if "scene" in decrypted:
+                sc = decrypted["scene"]
+                if "name" in sc and "id" in sc:
+                    scenes.append(ICS2000Scene(
+                        entity_id=sc["id"],
+                        name=sc["name"],
+                    ))
+                continue
+
+            # Check if this is a module/device
             if "module" not in decrypted:
                 continue
 
@@ -290,6 +315,7 @@ class ICS2000Hub:
             ))
 
         self._devices = devices
+        self._scenes = scenes
         return devices
 
     # ------------------------------------------------------------------
@@ -327,7 +353,13 @@ class ICS2000Hub:
     # Command Sending: Local UDP with Cloud Fallback
     # ------------------------------------------------------------------
 
-    def _send_command(self, entity_id: int, function: int, value: int | str) -> bool:
+    def _send_command(
+        self,
+        entity_id: int,
+        function: int,
+        value: int | str,
+        entity_type: str = "module",
+    ) -> bool:
         """
         Send a command to the ICS2000.
         Tries local UDP first (instant), falls back to cloud API if needed.
@@ -336,7 +368,9 @@ class ICS2000Hub:
             _LOGGER.error("Cannot send command: not logged in")
             return False
 
-        pkt = _build_command_bytes(self._mac, entity_id, function, value, self._aes_key)
+        pkt = _build_command_bytes(
+            self._mac, entity_id, function, value, self._aes_key, entity_type=entity_type
+        )
 
         # 1. Try Local UDP
         if not self._local_ip:
@@ -348,18 +382,17 @@ class ICS2000Hub:
                 sock.settimeout(1.5)
                 sock.sendto(pkt, (self._local_ip, HUB_UDP_PORT))
                 try:
-                    # Hub sends acknowledgment
                     sock.recvfrom(1024)
                 except socket.timeout:
                     pass
                 sock.close()
                 _LOGGER.debug(
-                    "Command sent via local UDP to %s: entity=%s fn=%s val=%s",
-                    self._local_ip, entity_id, function, value,
+                    "Command sent via local UDP to %s: type=%s entity=%s fn=%s val=%s",
+                    self._local_ip, entity_type, entity_id, function, value,
                 )
                 return True
             except Exception as exc:
-                _LOGGER.warning("Local UDP send to %s failed (%s), trying cloud fallback...", self._local_ip, exc)
+                _LOGGER.warning("Local UDP send failed (%s), trying cloud fallback...", exc)
                 self._local_ip = None
 
         # 2. Cloud Fallback
@@ -377,7 +410,7 @@ class ICS2000Hub:
                 timeout=TIMEOUT,
             )
             resp.raise_for_status()
-            _LOGGER.debug("Command sent via cloud: entity=%s fn=%s val=%s", entity_id, function, value)
+            _LOGGER.debug("Command sent via cloud: type=%s entity=%s fn=%s val=%s", entity_type, entity_id, function, value)
             return True
         except Exception as exc:
             _LOGGER.error("Cloud command failed for entity %s: %s", entity_id, exc)
@@ -408,6 +441,14 @@ class ICS2000Hub:
         """Close shutter (▼)."""
         return self._send_command(entity_id, CMD_FUNCTION_SHUTTER_CLOSE, SHUTTER_COMMAND_VALUE)
 
+    def run_scene(self, entity_id: int) -> bool:
+        """Run/Play an ICS2000 scene."""
+        return self._send_command(entity_id, 0, 1, entity_type="scene")
+
+    def stop_scene(self, entity_id: int) -> bool:
+        """Stop an ICS2000 scene."""
+        return self._send_command(entity_id, 0, 0, entity_type="scene")
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -427,3 +468,7 @@ class ICS2000Hub:
     @property
     def devices(self) -> list[ICS2000Device]:
         return self._devices
+
+    @property
+    def scenes(self) -> list[ICS2000Scene]:
+        return self._scenes

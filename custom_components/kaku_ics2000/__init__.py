@@ -8,15 +8,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     CONF_MAC,
-    DEVICE_TYPE_BINARY_SENSOR,
-    DEVICE_TYPE_COVER,
-    DEVICE_TYPE_LIGHT,
-    DEVICE_TYPE_SENSOR,
-    DEVICE_TYPE_SWITCH,
     DOMAIN,
     SCAN_INTERVAL_SECONDS,
 )
@@ -30,6 +25,8 @@ PLATFORMS: list[Platform] = [
     Platform.COVER,
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
+    Platform.SCENE,
+    Platform.BUTTON,
 ]
 
 
@@ -46,10 +43,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not ok:
         raise ConfigEntryNotReady("ICS2000 login failed — check credentials")
 
-    # Initial device fetch
+    # Initial device & scene fetch
     devices: list[ICS2000Device] = await hass.async_add_executor_job(hub.fetch_devices)
-    if not devices:
-        raise ConfigEntryNotReady("ICS2000 returned no devices")
+    if not devices and not hub.scenes:
+        raise ConfigEntryNotReady("ICS2000 returned no devices or scenes")
 
     # ---------------------------------------------------------------
     # DataUpdateCoordinator — polls status for all devices
@@ -78,6 +75,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "hub": hub,
         "coordinator": coordinator,
         "devices": hub.devices,
+        "scenes": hub.scenes,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
