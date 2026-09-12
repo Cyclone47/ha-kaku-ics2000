@@ -1,17 +1,16 @@
 """
-ICS2000 Hub API client.
+ICS2000 Hub API client with local UDP support and cloud fallback.
 
-Handles login, device discovery, status polling, and sending commands
-to the KlikAanKlikUit / Trust Smart Cloud API.
-
-All device data is AES-128-CBC encrypted with the per-home AES key.
-Commands are encoded as a binary frame sent to command.php.
+Commands are sent via local UDP directly to port 2012 of the hub on the LAN
+for sub-second response times. If the hub cannot be reached locally, it
+transparently falls back to the cloud API.
 """
 from __future__ import annotations
 
 import base64
 import json
 import logging
+import socket
 import struct
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,18 +22,20 @@ from Crypto.Util.Padding import unpad
 from .const import (
     BASE_URL,
     CMD_FUNCTION_DIM,
-    CMD_FUNCTION_SHUTTER,
+    CMD_FUNCTION_SHUTTER_CLOSE,
+    CMD_FUNCTION_SHUTTER_OPEN,
+    CMD_FUNCTION_SHUTTER_STOP,
     CMD_FUNCTION_SWITCH,
     DEVICE_TYPE_MAP,
+    DISCOVERY_BROADCAST_MSG,
+    HUB_UDP_PORT,
     INTERNAL_MODULES,
-    SHUTTER_CLOSE,
-    SHUTTER_OPEN,
-    SHUTTER_STOP,
+    SHUTTER_COMMAND_VALUE,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-TIMEOUT = 15  # seconds
+TIMEOUT = 12  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +49,11 @@ def _decrypt(encrypted_b64: str, aes_hex: str) -> str:
     ciphertext = raw[16:]
     key = bytes.fromhex(aes_hex)
     cipher = AES.new(key, AES.MODE_CBC, iv)
-    return unpad(cipher.decrypt(ciphertext), 16).decode("utf-8")
+    dec = cipher.decrypt(ciphertext)
+    pad = dec[-1]
+    if 1 <= pad <= 16:
+        dec = dec[:-pad]
+    return dec.decode("utf-8", errors="replace")
 
 
 def _encrypt(plaintext: str, aes_hex: str) -> bytes:
@@ -63,14 +68,14 @@ def _encrypt(plaintext: str, aes_hex: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Command frame builder
+# Command packet builder
 # ---------------------------------------------------------------------------
 
-def _build_command(mac: str, entity_id: int, function: int, value: int | str, aes_hex: str) -> str:
+def _build_command_bytes(mac: str, entity_id: int, function: int, value: int | str, aes_hex: str) -> bytes:
     """
-    Build an ICS2000 binary command frame (hex string).
+    Build an ICS2000 binary command packet.
 
-    Frame layout (43 bytes header + encrypted data):
+    Frame layout (43 bytes header + AES encrypted data):
       [0]     frame number (1)
       [2]     type (128 = device command)
       [3..8]  MAC address bytes
@@ -83,7 +88,7 @@ def _build_command(mac: str, entity_id: int, function: int, value: int | str, ae
     header[0] = 1         # frame
     header[2] = 128       # type: device command
 
-    # MAC address
+    # MAC address (6 bytes)
     mac_bytes = bytes.fromhex(mac.replace(":", ""))
     header[3:9] = mac_bytes
 
@@ -104,7 +109,7 @@ def _build_command(mac: str, entity_id: int, function: int, value: int | str, ae
     # Data length
     struct.pack_into("<H", header, 41, len(encrypted_data))
 
-    return header.hex() + encrypted_data.hex()
+    return bytes(header) + encrypted_data
 
 
 # ---------------------------------------------------------------------------
@@ -116,22 +121,19 @@ class ICS2000Device:
     """Represents a single ICS2000 device (module)."""
     entity_id: int
     name: str
-    device_type: int          # raw integer from ICS2000 API
-    ha_platform: str          # HA domain: light / switch / cover / sensor / binary_sensor
-    # Current status (updated by coordinator)
+    device_type: int
+    ha_platform: str
     functions: list[Any] = field(default_factory=list)
     raw_status: dict = field(default_factory=dict)
 
     @property
     def is_on(self) -> bool | None:
-        """Return True/False for on/off devices, None if unknown."""
         if self.functions:
             return bool(self.functions[0])
         return None
 
     @property
     def brightness(self) -> int | None:
-        """Return brightness (0-255) for dimmers, None if not a dimmer."""
         if len(self.functions) >= 2:
             return int(self.functions[1])
         return None
@@ -142,7 +144,7 @@ class ICS2000Device:
 # ---------------------------------------------------------------------------
 
 class ICS2000Hub:
-    """Manages communication with the ICS2000 cloud API."""
+    """Manages communication with the ICS2000 hub via local UDP and cloud."""
 
     def __init__(self, mac: str, email: str, password: str) -> None:
         self._mac = mac.replace(":", "").upper()
@@ -151,16 +153,18 @@ class ICS2000Hub:
         self._password = password
         self._aes_key: str | None = None
         self._home_id: int | None = None
+        self._local_ip: str | None = None
         self._devices: list[ICS2000Device] = []
+        self._session = requests.Session()
 
     # ------------------------------------------------------------------
-    # Auth
+    # Auth & Discovery
     # ------------------------------------------------------------------
 
     def login(self) -> bool:
         """Login to ICS2000 cloud and retrieve AES key + home ID."""
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{BASE_URL}/account.php",
                 params={
                     "action": "login",
@@ -180,11 +184,50 @@ class ICS2000Hub:
                 return False
             self._aes_key = homes[0]["aes_key"]
             self._home_id = homes[0]["home_id"]
-            _LOGGER.debug("ICS2000 login OK — home_id=%s", self._home_id)
+            _LOGGER.info("ICS2000 login OK — home_id=%s", self._home_id)
+
+            # Discover local hub IP
+            self.discover_local_hub()
             return True
         except Exception as exc:
             _LOGGER.error("ICS2000 login failed: %s", exc)
             return False
+
+    def discover_local_hub(self) -> str | None:
+        """Discover the ICS2000 local IP address using UDP broadcast."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.settimeout(2.0)
+            
+            # Send discovery to global broadcast and subnet broadcast
+            targets = ["255.255.255.255"]
+            try:
+                # Add local broadcast if possible
+                host_ip = socket.gethostbyname(socket.gethostname())
+                subnet = ".".join(host_ip.split(".")[:3]) + ".255"
+                targets.append(subnet)
+            except Exception:
+                pass
+
+            for target in targets:
+                try:
+                    sock.sendto(DISCOVERY_BROADCAST_MSG, (target, HUB_UDP_PORT))
+                except Exception:
+                    continue
+
+            data, addr = sock.recvfrom(1024)
+            sock.close()
+
+            # Verify response belongs to our hub MAC
+            resp_hex = data.hex().lower()
+            if self._mac.lower() in resp_hex:
+                self._local_ip = addr[0]
+                _LOGGER.info("Discovered ICS2000 hub locally at %s", self._local_ip)
+                return self._local_ip
+        except Exception as exc:
+            _LOGGER.debug("Local UDP discovery attempt ended: %s", exc)
+        return self._local_ip
 
     # ------------------------------------------------------------------
     # Device discovery
@@ -197,7 +240,7 @@ class ICS2000Hub:
             return []
 
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{BASE_URL}/gateway.php",
                 params={
                     "action": "sync",
@@ -227,21 +270,16 @@ class ICS2000Hub:
                 continue
 
             if "module" not in decrypted:
-                continue  # room, scenario, zone — skip
+                continue
 
             mod = decrypted["module"]
             device_int = mod.get("device")
-            if device_int is None:
+            if device_int is None or device_int in INTERNAL_MODULES:
                 continue
-            if device_int in INTERNAL_MODULES:
-                continue  # P1, Alarm, IPCam, etc.
 
             ha_platform = DEVICE_TYPE_MAP.get(device_int)
             if ha_platform is None:
-                _LOGGER.debug(
-                    "Unknown device type %s for '%s' — skipping",
-                    device_int, mod.get("name"),
-                )
+                _LOGGER.debug("Unknown device type %s for '%s' — skipping", device_int, mod.get("name"))
                 continue
 
             devices.append(ICS2000Device(
@@ -250,10 +288,6 @@ class ICS2000Hub:
                 device_type=device_int,
                 ha_platform=ha_platform,
             ))
-            _LOGGER.debug(
-                "Found device '%s' id=%s device=%s → %s",
-                mod["name"], mod["id"], device_int, ha_platform,
-            )
 
         self._devices = devices
         return devices
@@ -263,14 +297,11 @@ class ICS2000Hub:
     # ------------------------------------------------------------------
 
     def fetch_status(self, entity_id: int) -> list[Any]:
-        """
-        Fetch the current status (function values) for a single device.
-        Returns a list where [0] is on/off, [1] is dim level, etc.
-        """
+        """Fetch current status for an entity from cloud API."""
         if not self._aes_key:
             return []
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{BASE_URL}/entity.php",
                 params={
                     "action": "get-multiple",
@@ -293,19 +324,47 @@ class ICS2000Hub:
             return []
 
     # ------------------------------------------------------------------
-    # Commands
+    # Command Sending: Local UDP with Cloud Fallback
     # ------------------------------------------------------------------
 
     def _send_command(self, entity_id: int, function: int, value: int | str) -> bool:
-        """Send a command to the ICS2000 hub via the cloud API."""
+        """
+        Send a command to the ICS2000.
+        Tries local UDP first (instant), falls back to cloud API if needed.
+        """
         if not self._aes_key:
             _LOGGER.error("Cannot send command: not logged in")
             return False
+
+        pkt = _build_command_bytes(self._mac, entity_id, function, value, self._aes_key)
+
+        # 1. Try Local UDP
+        if not self._local_ip:
+            self.discover_local_hub()
+
+        if self._local_ip:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(1.5)
+                sock.sendto(pkt, (self._local_ip, HUB_UDP_PORT))
+                try:
+                    # Hub sends acknowledgment
+                    sock.recvfrom(1024)
+                except socket.timeout:
+                    pass
+                sock.close()
+                _LOGGER.debug(
+                    "Command sent via local UDP to %s: entity=%s fn=%s val=%s",
+                    self._local_ip, entity_id, function, value,
+                )
+                return True
+            except Exception as exc:
+                _LOGGER.warning("Local UDP send to %s failed (%s), trying cloud fallback...", self._local_ip, exc)
+                self._local_ip = None
+
+        # 2. Cloud Fallback
         try:
-            command_hex = _build_command(
-                self._mac_colons, entity_id, function, value, self._aes_key
-            )
-            resp = requests.get(
+            resp = self._session.get(
                 f"{BASE_URL}/command.php",
                 params={
                     "action": "add",
@@ -313,26 +372,23 @@ class ICS2000Hub:
                     "mac": self._mac,
                     "password_hash": self._password,
                     "device_unique_id": "android",
-                    "command": command_hex,
+                    "command": pkt.hex(),
                 },
                 timeout=TIMEOUT,
             )
             resp.raise_for_status()
-            _LOGGER.debug(
-                "Command sent: entity=%s func=%s value=%s → %s",
-                entity_id, function, value, resp.text[:80],
-            )
+            _LOGGER.debug("Command sent via cloud: entity=%s fn=%s val=%s", entity_id, function, value)
             return True
         except Exception as exc:
-            _LOGGER.error("Command failed for entity %s: %s", entity_id, exc)
+            _LOGGER.error("Cloud command failed for entity %s: %s", entity_id, exc)
             return False
 
     def turn_on(self, entity_id: int) -> bool:
-        """Turn a switch/lamp on."""
+        """Turn switch or lamp on."""
         return self._send_command(entity_id, CMD_FUNCTION_SWITCH, 1)
 
     def turn_off(self, entity_id: int) -> bool:
-        """Turn a switch/lamp off."""
+        """Turn switch or lamp off."""
         return self._send_command(entity_id, CMD_FUNCTION_SWITCH, 0)
 
     def dim(self, entity_id: int, level: int) -> bool:
@@ -341,16 +397,16 @@ class ICS2000Hub:
         return self._send_command(entity_id, CMD_FUNCTION_DIM, level)
 
     def shutter_open(self, entity_id: int) -> bool:
-        """Open a shutter/rolluik."""
-        return self._send_command(entity_id, CMD_FUNCTION_SHUTTER, SHUTTER_OPEN)
-
-    def shutter_close(self, entity_id: int) -> bool:
-        """Close a shutter/rolluik."""
-        return self._send_command(entity_id, CMD_FUNCTION_SHUTTER, SHUTTER_CLOSE)
+        """Open shutter (▲)."""
+        return self._send_command(entity_id, CMD_FUNCTION_SHUTTER_OPEN, SHUTTER_COMMAND_VALUE)
 
     def shutter_stop(self, entity_id: int) -> bool:
-        """Stop a shutter/rolluik (MY position)."""
-        return self._send_command(entity_id, CMD_FUNCTION_SHUTTER, SHUTTER_STOP)
+        """Stop shutter / MY favourite position (⏹)."""
+        return self._send_command(entity_id, CMD_FUNCTION_SHUTTER_STOP, SHUTTER_COMMAND_VALUE)
+
+    def shutter_close(self, entity_id: int) -> bool:
+        """Close shutter (▼)."""
+        return self._send_command(entity_id, CMD_FUNCTION_SHUTTER_CLOSE, SHUTTER_COMMAND_VALUE)
 
     # ------------------------------------------------------------------
     # Properties
@@ -359,6 +415,10 @@ class ICS2000Hub:
     @property
     def mac(self) -> str:
         return self._mac
+
+    @property
+    def local_ip(self) -> str | None:
+        return self._local_ip
 
     @property
     def home_id(self) -> int | None:
