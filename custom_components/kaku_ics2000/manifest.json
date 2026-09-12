@@ -1,0 +1,12 @@
+{
+  "domain": "kaku_ics2000",
+  "name": "KlikAanKlikUit ICS2000",
+  "version": "1.0.0",
+  "documentation": "https://github.com/Cyclone47/ha-kaku-ics2000",
+  "issue_tracker": "https://github.com/Cyclone47/ha-kaku-ics2000/issues",
+  "codeowners": ["@Cyclone47"],
+  "requirements": ["pycryptodome>=3.9.7"],
+  "dependencies": [],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}

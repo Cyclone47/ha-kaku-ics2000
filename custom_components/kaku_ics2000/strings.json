@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "KlikAanKlikUit ICS2000",
+        "description": "Enter your ICS2000 hub details. The MAC address is printed on the label of the hub.",
+        "data": {
+          "mac": "MAC Address (e.g. AA:BB:CC:DD:EE:FF)",
+          "email": "Email Address",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password. Please check your credentials.",
+      "cannot_connect": "Could not connect to the ICS2000 cloud. Check your internet connection.",
+      "invalid_mac": "Invalid MAC address format. Use AA:BB:CC:DD:EE:FF."
+    },
+    "abort": {
+      "already_configured": "This ICS2000 hub is already configured."
+    }
+  }
+}
